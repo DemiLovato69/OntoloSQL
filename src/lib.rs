@@ -153,4 +153,27 @@ s2	Blood & Water
 
         let _ = fs::remove_dir_all(&base_dir);
     }
+
+    #[test]
+    fn generates_actions_from_cavtrack_total_sql() {
+        let sql = fs::read_to_string("cavtrack_total.sql").expect("fixture should exist");
+
+        let schema = parse_postgres_schema(&sql).expect("schema should parse");
+        let module = map_schema_to_ontology(&schema).expect("schema should map");
+        let rendered = render_module(&module);
+
+        assert!(rendered.contains("import { DELETE_OBJECT_PARAMETER, MODIFY_OBJECT_PARAMETER, defineAction, defineLink, defineObject } from \"@osdk/maker\";"));
+        assert!(rendered.contains("export const createAsset = defineAction({"));
+        assert!(rendered.contains("export const updateAsset = defineAction({"));
+        assert!(rendered.contains("export const setTelemetryHardAccelerationEvents = defineAction({"));
+        assert!(rendered.contains("objectToModify: MODIFY_OBJECT_PARAMETER"));
+        assert!(rendered.contains("objectToDelete: DELETE_OBJECT_PARAMETER"));
+        assert!(module.actions.len() >= 10);
+        assert!(
+            module
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("get_asset"))
+        );
+    }
 }

@@ -3,12 +3,13 @@ use sqlparser::ast::{AlterTableOperation, ColumnOption, ObjectName, Statement, T
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::schema::{Column, DatabaseSchema, ForeignKey, Table};
+use crate::schema::{Column, DatabaseSchema, ForeignKey, SqlRoutine, SqlRoutineArg, Table};
 
 pub fn parse_postgres_schema(sql: &str) -> Result<DatabaseSchema> {
     let dialect = PostgreSqlDialect {};
     let mut tables = Vec::new();
     let mut foreign_keys = Vec::new();
+    let mut routines = Vec::new();
 
     for statement_sql in split_sql_statements(sql) {
         let parsed = match Parser::parse_sql(&dialect, &statement_sql) {
@@ -153,6 +154,28 @@ pub fn parse_postgres_schema(sql: &str) -> Result<DatabaseSchema> {
                         }
                     }
                 }
+                Statement::CreateFunction {
+                    name,
+                    args,
+                    return_type,
+                    ..
+                } => {
+                    routines.push(SqlRoutine {
+                        name: parse_object_name(&name),
+                        args: args
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|arg| {
+                                arg.name.map(|name| SqlRoutineArg {
+                                    name: name.value,
+                                    sql_type: arg.data_type.to_string(),
+                                    has_default: arg.default_expr.is_some(),
+                                })
+                            })
+                            .collect(),
+                        return_type: return_type.map(|data_type| data_type.to_string()),
+                    });
+                }
                 _ => {}
             }
         }
@@ -161,6 +184,7 @@ pub fn parse_postgres_schema(sql: &str) -> Result<DatabaseSchema> {
     Ok(DatabaseSchema {
         tables,
         foreign_keys,
+        routines,
     })
 }
 
@@ -466,5 +490,37 @@ ALTER TABLE ONLY public.lego_sets
         assert_eq!(statements.len(), 2);
         assert!(statements[0].starts_with("COPY public.lego_sets"));
         assert!(statements[1].contains("ADD CONSTRAINT lego_sets_pkey PRIMARY KEY"));
+    }
+
+    #[test]
+    fn parses_create_function_arguments() {
+        let schema = parse_postgres_schema(
+            r#"
+            CREATE TABLE asset (
+                asset_id varchar(20) PRIMARY KEY,
+                vin varchar(17) NOT NULL
+            );
+
+            CREATE OR REPLACE FUNCTION create_asset(
+                p_asset_id varchar(20),
+                p_vin varchar(17),
+                p_metadata jsonb DEFAULT NULL
+            )
+            RETURNS asset
+            LANGUAGE sql
+            AS $$
+                SELECT NULL::asset;
+            $$;
+            "#,
+        )
+        .expect("schema should parse");
+
+        assert_eq!(schema.routines.len(), 1);
+        assert_eq!(schema.routines[0].name, "create_asset");
+        assert_eq!(schema.routines[0].args.len(), 3);
+        assert_eq!(schema.routines[0].args[0].name, "p_asset_id");
+        assert_eq!(schema.routines[0].args[2].sql_type, "JSONB");
+        assert!(schema.routines[0].args[2].has_default);
+        assert_eq!(schema.routines[0].return_type.as_deref(), Some("asset"));
     }
 }

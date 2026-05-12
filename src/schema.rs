@@ -2,6 +2,7 @@
 pub struct DatabaseSchema {
     pub tables: Vec<Table>,
     pub foreign_keys: Vec<ForeignKey>,
+    pub routines: Vec<SqlRoutine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,4 +27,18 @@ pub struct ForeignKey {
     pub source_columns: Vec<String>,
     pub target_table: String,
     pub target_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRoutine {
+    pub name: String,
+    pub args: Vec<SqlRoutineArg>,
+    pub return_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRoutineArg {
+    pub name: String,
+    pub sql_type: String,
+    pub has_default: bool,
 }

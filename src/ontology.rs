@@ -2,6 +2,7 @@
 pub struct ModuleDefinition {
     pub objects: Vec<ObjectDefinition>,
     pub links: Vec<LinkDefinition>,
+    pub actions: Vec<ActionDefinition>,
     pub warnings: Vec<String>,
 }
 
@@ -38,4 +39,47 @@ pub struct LinkEndpointDefinition {
     pub api_name: String,
     pub display_name: String,
     pub plural_display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDefinition {
+    pub const_name: String,
+    pub api_name: String,
+    pub display_name: String,
+    pub object_const_name: String,
+    pub object_api_name: String,
+    pub kind: ActionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionKind {
+    Create {
+        parameters: Vec<ActionParameterDefinition>,
+        property_mappings: Vec<ActionPropertyMapping>,
+    },
+    Modify {
+        parameters: Vec<ActionParameterDefinition>,
+        property_mappings: Vec<ActionPropertyMapping>,
+    },
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionParameterDefinition {
+    pub id: String,
+    pub display_name: String,
+    pub parameter_type: ActionParameterTypeDefinition,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionParameterTypeDefinition {
+    Primitive(String),
+    ObjectReference { object_api_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionPropertyMapping {
+    pub property_api_name: String,
+    pub parameter_id: String,
 }

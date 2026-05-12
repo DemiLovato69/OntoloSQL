@@ -4,13 +4,16 @@ use anyhow::{Result, anyhow, bail};
 use convert_case::{Case, Casing};
 
 use crate::ontology::{
-    LinkDefinition, LinkEndpointDefinition, ModuleDefinition, ObjectDefinition, PropertyDefinition,
+    ActionDefinition, ActionKind, ActionParameterDefinition, ActionParameterTypeDefinition,
+    ActionPropertyMapping, LinkDefinition, LinkEndpointDefinition, ModuleDefinition,
+    ObjectDefinition, PropertyDefinition,
 };
-use crate::schema::{Column, DatabaseSchema, ForeignKey, Table};
+use crate::schema::{Column, DatabaseSchema, ForeignKey, SqlRoutine, SqlRoutineArg, Table};
 
 pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinition> {
     let mut objects = Vec::with_capacity(schema.tables.len());
     let mut entity_names_by_table = HashMap::with_capacity(schema.tables.len());
+    let mut object_definitions_by_table = HashMap::with_capacity(schema.tables.len());
     let mut warnings = Vec::new();
     let mut incoming_foreign_key_targets: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut outgoing_foreign_key_sources: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -45,7 +48,9 @@ pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinitio
             warnings.push(format!("table '{}': {}", table.name, warning));
         }
 
-        objects.push(map_table(table, &entity_names, &primary_key)?);
+        let object = map_table(table, &entity_names, &primary_key)?;
+        object_definitions_by_table.insert(table.name.clone(), object.clone());
+        objects.push(object);
     }
 
     let links = schema
@@ -54,9 +59,21 @@ pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinitio
         .map(|foreign_key| map_foreign_key(foreign_key, &entity_names_by_table))
         .collect::<Result<Vec<_>>>()?;
 
+    let mut actions = Vec::new();
+    for routine in &schema.routines {
+        match map_routine_to_action(routine, &object_definitions_by_table)? {
+            Some(action) => actions.push(action),
+            None => warnings.push(format!(
+                "routine '{}': read-only routines are not emitted as ontology actions",
+                routine.name
+            )),
+        }
+    }
+
     Ok(ModuleDefinition {
         objects,
         links,
+        actions,
         warnings,
     })
 }
@@ -159,6 +176,304 @@ fn map_foreign_key(
         },
         many_foreign_key_property: to_property_api_name(source_column),
     })
+}
+
+fn map_routine_to_action(
+    routine: &SqlRoutine,
+    objects_by_table: &HashMap<String, ObjectDefinition>,
+) -> Result<Option<ActionDefinition>> {
+    if let Some(table_name) = routine.name.strip_prefix("create_") {
+        let object = objects_by_table
+            .get(table_name)
+            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+
+        let property_mappings = routine
+            .args
+            .iter()
+            .map(|arg| {
+                Ok(ActionPropertyMapping {
+                    property_api_name: resolve_property_api_name(object, &arg.name, None)?,
+                    parameter_id: routine_parameter_id(&arg.name),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let parameters = routine
+            .args
+            .iter()
+            .map(|arg| map_routine_arg_to_parameter(arg, object))
+            .collect::<Vec<_>>();
+
+        return Ok(Some(ActionDefinition {
+            const_name: sanitize_identifier(&routine.name.to_case(Case::Camel)),
+            api_name: to_action_api_name(&routine.name),
+            display_name: routine_display_name(&routine.name),
+            object_const_name: object.const_name.clone(),
+            object_api_name: object.api_name.clone(),
+            kind: ActionKind::Create {
+                parameters,
+                property_mappings,
+            },
+        }));
+    }
+
+    if let Some(table_name) = routine.name.strip_prefix("update_") {
+        let object = objects_by_table
+            .get(table_name)
+            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+        let primary_key_arg = routine
+            .args
+            .first()
+            .ok_or_else(|| anyhow!("routine '{}' does not define a target key argument", routine.name))?;
+
+        let property_mappings = routine
+            .args
+            .iter()
+            .skip(1)
+            .map(|arg| {
+                Ok(ActionPropertyMapping {
+                    property_api_name: resolve_property_api_name(
+                        object,
+                        &arg.name,
+                        arg.name.strip_prefix("p_new_"),
+                    )?,
+                    parameter_id: routine_parameter_id(&arg.name),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut parameters = Vec::with_capacity(routine.args.len());
+        parameters.push(target_object_parameter(object));
+        parameters.extend(
+            routine
+                .args
+                .iter()
+                .skip(1)
+                .map(|arg| map_routine_arg_to_parameter(arg, object)),
+        );
+
+        if !matches_target_primary_key_arg(primary_key_arg, object) {
+            bail!(
+                "routine '{}' does not use its first argument as the primary key for table '{}'",
+                routine.name,
+                table_name
+            );
+        }
+
+        return Ok(Some(ActionDefinition {
+            const_name: sanitize_identifier(&routine.name.to_case(Case::Camel)),
+            api_name: to_action_api_name(&routine.name),
+            display_name: routine_display_name(&routine.name),
+            object_const_name: object.const_name.clone(),
+            object_api_name: object.api_name.clone(),
+            kind: ActionKind::Modify {
+                parameters,
+                property_mappings,
+            },
+        }));
+    }
+
+    if let Some(table_name) = routine.name.strip_prefix("delete_") {
+        let object = objects_by_table
+            .get(table_name)
+            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+
+        if let Some(primary_key_arg) = routine.args.first() {
+            if !matches_target_primary_key_arg(primary_key_arg, object) {
+                bail!(
+                    "routine '{}' does not use its first argument as the primary key for table '{}'",
+                    routine.name,
+                    table_name
+                );
+            }
+        }
+
+        return Ok(Some(ActionDefinition {
+            const_name: sanitize_identifier(&routine.name.to_case(Case::Camel)),
+            api_name: to_action_api_name(&routine.name),
+            display_name: routine_display_name(&routine.name),
+            object_const_name: object.const_name.clone(),
+            object_api_name: object.api_name.clone(),
+            kind: ActionKind::Delete,
+        }));
+    }
+
+    if let Some(rest) = routine.name.strip_prefix("set_") {
+        let (table_name, property_name) = split_set_routine_name(rest, objects_by_table)
+            .ok_or_else(|| anyhow!("routine '{}' does not match set_<table>_<property> naming", routine.name))?;
+        let object = objects_by_table
+            .get(table_name)
+            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+        let primary_key_arg = routine
+            .args
+            .first()
+            .ok_or_else(|| anyhow!("routine '{}' does not define a target key argument", routine.name))?;
+
+        if !matches_target_primary_key_arg(primary_key_arg, object) {
+            bail!(
+                "routine '{}' does not use its first argument as the primary key for table '{}'",
+                routine.name,
+                table_name
+            );
+        }
+
+        let value_arg = routine
+            .args
+            .get(1)
+            .ok_or_else(|| anyhow!("routine '{}' does not define a value argument", routine.name))?;
+
+        let parameters = vec![
+            target_object_parameter(object),
+            map_routine_arg_to_parameter(value_arg, object),
+        ];
+        let property_mappings = vec![ActionPropertyMapping {
+            property_api_name: resolve_property_api_name(object, &value_arg.name, Some(property_name))?,
+            parameter_id: routine_parameter_id(&value_arg.name),
+        }];
+
+        return Ok(Some(ActionDefinition {
+            const_name: sanitize_identifier(&routine.name.to_case(Case::Camel)),
+            api_name: to_action_api_name(&routine.name),
+            display_name: routine_display_name(&routine.name),
+            object_const_name: object.const_name.clone(),
+            object_api_name: object.api_name.clone(),
+            kind: ActionKind::Modify {
+                parameters,
+                property_mappings,
+            },
+        }));
+    }
+
+    if routine.name.starts_with("get_") || routine.name.starts_with("list_") {
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
+fn split_set_routine_name<'a>(
+    rest: &'a str,
+    objects_by_table: &'a HashMap<String, ObjectDefinition>,
+) -> Option<(&'a str, &'a str)> {
+    let mut candidates = objects_by_table
+        .keys()
+        .filter_map(|table_name| {
+            let prefix = format!("{table_name}_");
+            rest.strip_prefix(&prefix).map(|property_name| (table_name.as_str(), property_name))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by_key(|(table_name, _)| std::cmp::Reverse(table_name.len()));
+    candidates.into_iter().next()
+}
+
+fn resolve_property_api_name(
+    object: &ObjectDefinition,
+    routine_arg_name: &str,
+    override_column_name: Option<&str>,
+) -> Result<String> {
+    let candidate_names = [
+        override_column_name.map(ToOwned::to_owned),
+        Some(strip_routine_arg_prefix(routine_arg_name).to_owned()),
+        strip_routine_arg_prefix(routine_arg_name)
+            .strip_prefix("new_")
+            .map(ToOwned::to_owned),
+    ];
+
+    for candidate in candidate_names.into_iter().flatten() {
+        let property_api_name = to_property_api_name(&candidate);
+        if object
+            .properties
+            .iter()
+            .any(|property| property.api_name == property_api_name)
+        {
+            return Ok(property_api_name);
+        }
+    }
+
+    bail!(
+        "routine argument '{}' does not match any property on object '{}'",
+        routine_arg_name,
+        object.api_name
+    )
+}
+
+fn strip_routine_arg_prefix(name: &str) -> &str {
+    name.strip_prefix("p_").unwrap_or(name)
+}
+
+fn routine_parameter_id(name: &str) -> String {
+    sanitize_identifier(&strip_routine_arg_prefix(name).to_case(Case::Camel))
+}
+
+fn target_object_parameter(object: &ObjectDefinition) -> ActionParameterDefinition {
+    ActionParameterDefinition {
+        id: "objectToModifyParameter".to_owned(),
+        display_name: "Modify Object".to_owned(),
+        parameter_type: ActionParameterTypeDefinition::ObjectReference {
+            object_api_name: object.api_name.clone(),
+        },
+        required: true,
+    }
+}
+
+fn map_routine_arg_to_parameter(
+    arg: &SqlRoutineArg,
+    _object: &ObjectDefinition,
+) -> ActionParameterDefinition {
+    ActionParameterDefinition {
+        id: routine_parameter_id(&arg.name),
+        display_name: strip_routine_arg_prefix(&arg.name).to_case(Case::Title),
+        parameter_type: ActionParameterTypeDefinition::Primitive(
+            map_sql_type(&arg.sql_type).to_owned(),
+        ),
+        required: !arg.has_default,
+    }
+}
+
+fn matches_target_primary_key_arg(arg: &SqlRoutineArg, object: &ObjectDefinition) -> bool {
+    routine_parameter_id(&arg.name) == object.primary_key_property_api_name
+}
+
+fn routine_display_name(name: &str) -> String {
+    name.replace('_', " ").to_case(Case::Title)
+}
+
+fn to_action_api_name(name: &str) -> String {
+    sanitize_action_api_name(&name.to_case(Case::Kebab))
+}
+
+fn sanitize_action_api_name(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+
+    for ch in value.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+
+        if normalized == '-' {
+            if !output.is_empty() && !last_was_dash {
+                output.push('-');
+            }
+            last_was_dash = true;
+        } else {
+            output.push(normalized);
+            last_was_dash = false;
+        }
+    }
+
+    while output.ends_with('-') {
+        output.pop();
+    }
+
+    if output.is_empty() {
+        "action".to_owned()
+    } else {
+        output
+    }
 }
 
 fn infer_primary_key_column<'a>(
@@ -581,9 +896,12 @@ impl<'a> PrimaryKeySelection<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::{Column, Table};
+    use crate::schema::{Column, DatabaseSchema, SqlRoutine, SqlRoutineArg, Table};
 
-    use super::{entity_names, infer_primary_key_column, map_table, singularize_identifier};
+    use super::{
+        ActionKind, entity_names, infer_primary_key_column, map_schema_to_ontology, map_table,
+        singularize_identifier,
+    };
 
     #[test]
     fn chooses_string_title_property_before_primary_key() {
@@ -779,5 +1097,78 @@ mod tests {
                 .iter()
                 .any(|property| property.api_name == "playlistIdTrackIdKey")
         );
+    }
+
+    #[test]
+    fn maps_update_routine_to_modify_action_with_primary_key_reassignment() {
+        let schema = DatabaseSchema {
+            tables: vec![Table {
+                name: "asset".to_owned(),
+                columns: vec![
+                    Column {
+                        name: "asset_id".to_owned(),
+                        sql_type: "varchar(20)".to_owned(),
+                        nullable: false,
+                        default: None,
+                    },
+                    Column {
+                        name: "vin".to_owned(),
+                        sql_type: "varchar(17)".to_owned(),
+                        nullable: false,
+                        default: None,
+                    },
+                ],
+                primary_key: vec!["asset_id".to_owned()],
+            }],
+            foreign_keys: vec![],
+            routines: vec![SqlRoutine {
+                name: "update_asset".to_owned(),
+                args: vec![
+                    SqlRoutineArg {
+                        name: "p_asset_id".to_owned(),
+                        sql_type: "varchar(20)".to_owned(),
+                        has_default: false,
+                    },
+                    SqlRoutineArg {
+                        name: "p_new_asset_id".to_owned(),
+                        sql_type: "varchar(20)".to_owned(),
+                        has_default: false,
+                    },
+                    SqlRoutineArg {
+                        name: "p_vin".to_owned(),
+                        sql_type: "varchar(17)".to_owned(),
+                        has_default: false,
+                    },
+                ],
+                return_type: Some("asset".to_owned()),
+            }],
+        };
+
+        let module = map_schema_to_ontology(&schema).expect("schema should map");
+        assert_eq!(module.actions.len(), 1);
+        let rendered_target = &module.actions[0];
+        assert_eq!(rendered_target.api_name, "update-asset");
+
+        match &rendered_target.kind {
+            ActionKind::Modify {
+                parameters,
+                property_mappings,
+            } => {
+                assert_eq!(parameters[0].id, "objectToModifyParameter");
+                assert!(
+                    property_mappings
+                        .iter()
+                        .any(|mapping| mapping.property_api_name == "assetId"
+                            && mapping.parameter_id == "newAssetId")
+                );
+                assert!(
+                    property_mappings
+                        .iter()
+                        .any(|mapping| mapping.property_api_name == "vin"
+                            && mapping.parameter_id == "vin")
+                );
+            }
+            _ => panic!("expected modify action"),
+        }
     }
 }
