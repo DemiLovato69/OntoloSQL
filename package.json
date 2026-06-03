@@ -1,0 +1,23 @@
+{
+  "name": "ontolosql",
+  "version": "1.0.0",
+  "description": "`ontolosql` is a Rust CLI that generates TypeScript ontology definition files for `@osdk/maker` from PostgreSQL schema files.",
+  "homepage": "https://github.com/DemiLovato69/OntoloSQL#readme",
+  "bugs": {
+    "url": "https://github.com/DemiLovato69/OntoloSQL/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DemiLovato69/OntoloSQL.git"
+  },
+  "license": "MIT",
+  "author": "Demetry Romanowski",
+  "type": "commonjs",
+  "main": "cargo run",
+  "scripts": {
+    "test": "cargo test"
+  },
+  "dependencies": {
+    "@osdk/maker": "^0.32.0"
+  }
+}
