@@ -2,3 +2,5 @@
 @osdk/
 *.mts
 *.sql
+.idea/
+.DS_Store
