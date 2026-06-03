@@ -275,9 +275,9 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
             }
             '$' => {
                 let mut probe = String::from("$");
-                let mut lookahead = chars.clone();
+                let lookahead = chars.clone();
 
-                while let Some(next) = lookahead.next() {
+                for next in lookahead { 
                     probe.push(next);
                     if next == '$' {
                         break;

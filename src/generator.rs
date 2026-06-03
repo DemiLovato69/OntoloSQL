@@ -23,10 +23,8 @@ pub fn generate_file(options: GenerateOptions) -> Result<()> {
         eprintln!("Warning: {warning}");
     }
 
-    if let Some(parent) = options.output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = options.output.parent() && !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
     }
 
     fs::write(&options.output, rendered)?;

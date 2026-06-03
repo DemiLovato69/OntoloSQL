@@ -278,14 +278,12 @@ fn map_routine_to_action(
             .get(table_name)
             .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
 
-        if let Some(primary_key_arg) = routine.args.first() {
-            if !matches_target_primary_key_arg(primary_key_arg, object) {
-                bail!(
-                    "routine '{}' does not use its first argument as the primary key for table '{}'",
-                    routine.name,
-                    table_name
-                );
-            }
+        if let Some(primary_key_arg) = routine.args.first() && !matches_target_primary_key_arg(primary_key_arg, object) {
+            bail!(
+                "routine '{}' does not use its first argument as the primary key for table '{}'",
+                routine.name,
+                table_name
+            );
         }
 
         return Ok(Some(ActionDefinition {
