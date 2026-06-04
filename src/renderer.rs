@@ -1,12 +1,24 @@
 use crate::ontology::{
     ActionDefinition, ActionKind, ActionParameterDefinition, ActionParameterTypeDefinition,
     LinkDefinition, LinkEndpointDefinition, ModuleDefinition, ObjectDefinition, PropertyDefinition,
+    ValueTypeDefinition,
 };
 
 pub fn render_module(module: &ModuleDefinition) -> String {
     let import = render_import(module);
 
     let mut output = import;
+
+    for (index, value_type) in module.value_types.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        output.push_str(&render_value_type(value_type));
+    }
+
+    if !module.value_types.is_empty() && !module.objects.is_empty() {
+        output.push('\n');
+    }
 
     for (index, object) in module.objects.iter().enumerate() {
         if index > 0 {
@@ -43,6 +55,10 @@ pub fn render_module(module: &ModuleDefinition) -> String {
 fn render_import(module: &ModuleDefinition) -> String {
     let mut imports = vec!["defineObject"];
 
+    if !module.value_types.is_empty() {
+        imports.push("defineValueType");
+    }
+
     if !module.links.is_empty() {
         imports.push("defineLink");
     }
@@ -68,7 +84,41 @@ fn render_import(module: &ModuleDefinition) -> String {
     imports.sort_unstable();
     imports.dedup();
 
-    format!("import {{ {} }} from \"@osdk/maker\";\n\n", imports.join(", "))
+    format!(
+        "import {{ {} }} from \"@osdk/maker\";\n\n",
+        imports.join(", ")
+    )
+}
+
+fn render_value_type(value_type: &ValueTypeDefinition) -> String {
+    let allowed_values = value_type
+        .values
+        .iter()
+        .map(|value| format!("\"{}\"", escape_ts_string(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut output = String::new();
+    output.push_str(&format!(
+        "export const {} = defineValueType({{\n",
+        value_type.const_name
+    ));
+    output.push_str(&format!("  apiName: \"{}\",\n", value_type.api_name));
+    output.push_str(&format!(
+        "  displayName: \"{}\",\n",
+        escape_ts_string(&value_type.display_name)
+    ));
+    output.push_str("  type: {\n");
+    output.push_str("    type: \"string\",\n");
+    output.push_str("    constraints: [{\n");
+    output.push_str("      constraint: {\n");
+    output.push_str(&format!("        allowedValues: [{}],\n", allowed_values));
+    output.push_str("      },\n");
+    output.push_str("    }],\n");
+    output.push_str("  },\n");
+    output.push_str("  version: \"0.1.0\",\n");
+    output.push_str("});\n");
+    output
 }
 
 fn render_object(object: &ObjectDefinition) -> String {
@@ -103,10 +153,19 @@ fn render_object(object: &ObjectDefinition) -> String {
 }
 
 fn render_property(property: &PropertyDefinition) -> String {
+    let value_type = property
+        .value_type_const_name
+        .as_ref()
+        .map(|const_name| format!(", valueType: {}", const_name))
+        .unwrap_or_default();
     format!(
-        "    \"{}\": {{ type: \"{}\", displayName: \"{}\" }},\n",
-        property.api_name, property.osdk_type, property.display_name
+        "    \"{}\": {{ type: \"{}\", displayName: \"{}\"{} }},\n",
+        property.api_name, property.osdk_type, property.display_name, value_type
     )
+}
+
+fn escape_ts_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn render_link(link: &LinkDefinition) -> String {
@@ -234,7 +293,10 @@ fn render_delete_target_parameter(object_api_name: &str) -> String {
     output.push_str("      type: {\n");
     output.push_str("        type: \"objectReference\",\n");
     output.push_str("        objectReference: {\n");
-    output.push_str(&format!("          objectTypeId: \"{}\",\n", object_api_name));
+    output.push_str(&format!(
+        "          objectTypeId: \"{}\",\n",
+        object_api_name
+    ));
     output.push_str("        },\n");
     output.push_str("      },\n");
     output.push_str(

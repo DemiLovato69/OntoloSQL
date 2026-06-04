@@ -6,12 +6,30 @@ use convert_case::{Case, Casing};
 use crate::ontology::{
     ActionDefinition, ActionKind, ActionParameterDefinition, ActionParameterTypeDefinition,
     ActionPropertyMapping, LinkDefinition, LinkEndpointDefinition, ModuleDefinition,
-    ObjectDefinition, PropertyDefinition,
+    ObjectDefinition, PropertyDefinition, ValueTypeDefinition,
 };
-use crate::schema::{Column, DatabaseSchema, ForeignKey, SqlRoutine, SqlRoutineArg, Table};
+use crate::schema::{
+    Column, DatabaseSchema, ForeignKey, SqlEnumType, SqlRoutine, SqlRoutineArg, Table,
+};
 
 pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinition> {
     let mut objects = Vec::with_capacity(schema.tables.len());
+    let value_types = schema
+        .enum_types
+        .iter()
+        .map(map_enum_type_to_value_type)
+        .collect::<Vec<_>>();
+    let enum_value_types_by_sql_type = schema
+        .enum_types
+        .iter()
+        .zip(value_types.iter())
+        .map(|(enum_type, value_type)| {
+            (
+                normalize_sql_type_name(&enum_type.name),
+                value_type.const_name.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut entity_names_by_table = HashMap::with_capacity(schema.tables.len());
     let mut object_definitions_by_table = HashMap::with_capacity(schema.tables.len());
     let mut warnings = Vec::new();
@@ -48,7 +66,12 @@ pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinitio
             warnings.push(format!("table '{}': {}", table.name, warning));
         }
 
-        let object = map_table(table, &entity_names, &primary_key)?;
+        let object = map_table(
+            table,
+            &entity_names,
+            &primary_key,
+            &enum_value_types_by_sql_type,
+        )?;
         object_definitions_by_table.insert(table.name.clone(), object.clone());
         objects.push(object);
     }
@@ -71,6 +94,7 @@ pub fn map_schema_to_ontology(schema: &DatabaseSchema) -> Result<ModuleDefinitio
     }
 
     Ok(ModuleDefinition {
+        value_types,
         objects,
         links,
         actions,
@@ -82,11 +106,12 @@ fn map_table(
     table: &Table,
     entity_names: &EntityNames,
     primary_key: &PrimaryKeySelection<'_>,
+    enum_value_types_by_sql_type: &HashMap<String, String>,
 ) -> Result<ObjectDefinition> {
     let mut properties: Vec<PropertyDefinition> = table
         .columns
         .iter()
-        .map(map_column)
+        .map(|column| map_column(column, enum_value_types_by_sql_type))
         .collect::<Result<Vec<_>>>()?;
 
     if let Some(property) = &primary_key.synthetic_property {
@@ -113,16 +138,36 @@ fn map_table(
     })
 }
 
-fn map_column(column: &Column) -> Result<PropertyDefinition> {
+fn map_column(
+    column: &Column,
+    enum_value_types_by_sql_type: &HashMap<String, String>,
+) -> Result<PropertyDefinition> {
     let api_name = to_property_api_name(&column.name);
     let display_name = column.name.to_case(Case::Title);
-    let osdk_type = map_sql_type(&column.sql_type).to_owned();
+    let value_type_const_name =
+        enum_value_types_by_sql_type.get(&normalize_sql_type_name(&column.sql_type));
+    let osdk_type = if value_type_const_name.is_some() {
+        "string".to_owned()
+    } else {
+        map_sql_type(&column.sql_type).to_owned()
+    };
 
     Ok(PropertyDefinition {
         api_name,
         display_name,
         osdk_type,
+        value_type_const_name: value_type_const_name.cloned(),
     })
+}
+
+fn map_enum_type_to_value_type(enum_type: &SqlEnumType) -> ValueTypeDefinition {
+    let api_name = sanitize_identifier(&enum_type.name.to_case(Case::Camel));
+    ValueTypeDefinition {
+        const_name: format!("{}ValueType", api_name),
+        api_name,
+        display_name: enum_type.name.to_case(Case::Title),
+        values: enum_type.values.clone(),
+    }
 }
 
 fn map_foreign_key(
@@ -183,9 +228,13 @@ fn map_routine_to_action(
     objects_by_table: &HashMap<String, ObjectDefinition>,
 ) -> Result<Option<ActionDefinition>> {
     if let Some(table_name) = routine.name.strip_prefix("create_") {
-        let object = objects_by_table
-            .get(table_name)
-            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+        let object = objects_by_table.get(table_name).ok_or_else(|| {
+            anyhow!(
+                "routine '{}' references unknown table '{}'",
+                routine.name,
+                table_name
+            )
+        })?;
 
         let property_mappings = routine
             .args
@@ -218,13 +267,19 @@ fn map_routine_to_action(
     }
 
     if let Some(table_name) = routine.name.strip_prefix("update_") {
-        let object = objects_by_table
-            .get(table_name)
-            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
-        let primary_key_arg = routine
-            .args
-            .first()
-            .ok_or_else(|| anyhow!("routine '{}' does not define a target key argument", routine.name))?;
+        let object = objects_by_table.get(table_name).ok_or_else(|| {
+            anyhow!(
+                "routine '{}' references unknown table '{}'",
+                routine.name,
+                table_name
+            )
+        })?;
+        let primary_key_arg = routine.args.first().ok_or_else(|| {
+            anyhow!(
+                "routine '{}' does not define a target key argument",
+                routine.name
+            )
+        })?;
 
         let property_mappings = routine
             .args
@@ -274,11 +329,17 @@ fn map_routine_to_action(
     }
 
     if let Some(table_name) = routine.name.strip_prefix("delete_") {
-        let object = objects_by_table
-            .get(table_name)
-            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
+        let object = objects_by_table.get(table_name).ok_or_else(|| {
+            anyhow!(
+                "routine '{}' references unknown table '{}'",
+                routine.name,
+                table_name
+            )
+        })?;
 
-        if let Some(primary_key_arg) = routine.args.first() && !matches_target_primary_key_arg(primary_key_arg, object) {
+        if let Some(primary_key_arg) = routine.args.first()
+            && !matches_target_primary_key_arg(primary_key_arg, object)
+        {
             bail!(
                 "routine '{}' does not use its first argument as the primary key for table '{}'",
                 routine.name,
@@ -298,14 +359,25 @@ fn map_routine_to_action(
 
     if let Some(rest) = routine.name.strip_prefix("set_") {
         let (table_name, property_name) = split_set_routine_name(rest, objects_by_table)
-            .ok_or_else(|| anyhow!("routine '{}' does not match set_<table>_<property> naming", routine.name))?;
-        let object = objects_by_table
-            .get(table_name)
-            .ok_or_else(|| anyhow!("routine '{}' references unknown table '{}'", routine.name, table_name))?;
-        let primary_key_arg = routine
-            .args
-            .first()
-            .ok_or_else(|| anyhow!("routine '{}' does not define a target key argument", routine.name))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "routine '{}' does not match set_<table>_<property> naming",
+                    routine.name
+                )
+            })?;
+        let object = objects_by_table.get(table_name).ok_or_else(|| {
+            anyhow!(
+                "routine '{}' references unknown table '{}'",
+                routine.name,
+                table_name
+            )
+        })?;
+        let primary_key_arg = routine.args.first().ok_or_else(|| {
+            anyhow!(
+                "routine '{}' does not define a target key argument",
+                routine.name
+            )
+        })?;
 
         if !matches_target_primary_key_arg(primary_key_arg, object) {
             bail!(
@@ -315,17 +387,23 @@ fn map_routine_to_action(
             );
         }
 
-        let value_arg = routine
-            .args
-            .get(1)
-            .ok_or_else(|| anyhow!("routine '{}' does not define a value argument", routine.name))?;
+        let value_arg = routine.args.get(1).ok_or_else(|| {
+            anyhow!(
+                "routine '{}' does not define a value argument",
+                routine.name
+            )
+        })?;
 
         let parameters = vec![
             target_object_parameter(object),
             map_routine_arg_to_parameter(value_arg, object),
         ];
         let property_mappings = vec![ActionPropertyMapping {
-            property_api_name: resolve_property_api_name(object, &value_arg.name, Some(property_name))?,
+            property_api_name: resolve_property_api_name(
+                object,
+                &value_arg.name,
+                Some(property_name),
+            )?,
             parameter_id: routine_parameter_id(&value_arg.name),
         }];
 
@@ -357,7 +435,8 @@ fn split_set_routine_name<'a>(
         .keys()
         .filter_map(|table_name| {
             let prefix = format!("{table_name}_");
-            rest.strip_prefix(&prefix).map(|property_name| (table_name.as_str(), property_name))
+            rest.strip_prefix(&prefix)
+                .map(|property_name| (table_name.as_str(), property_name))
         })
         .collect::<Vec<_>>();
 
@@ -628,6 +707,13 @@ fn to_property_api_name(name: &str) -> String {
     sanitize_identifier(&name.to_case(Case::Camel))
 }
 
+fn normalize_sql_type_name(name: &str) -> String {
+    name.trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase()
+}
+
 fn sanitize_identifier(value: &str) -> String {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -883,6 +969,7 @@ impl<'a> PrimaryKeySelection<'a> {
                 api_name,
                 display_name,
                 osdk_type: "string".to_owned(),
+                value_type_const_name: None,
             }),
             warning: Some(format!(
                 "uses composite primary key ({}); generated synthetic string primary key",
@@ -894,6 +981,8 @@ impl<'a> PrimaryKeySelection<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::schema::{Column, DatabaseSchema, SqlRoutine, SqlRoutineArg, Table};
 
     use super::{
@@ -923,8 +1012,13 @@ mod tests {
         };
 
         let primary_key = infer_primary_key_column(&table, &[], &[]).expect("pk should resolve");
-        let object =
-            map_table(&table, &entity_names(&table.name), &primary_key).expect("table should map");
+        let object = map_table(
+            &table,
+            &entity_names(&table.name),
+            &primary_key,
+            &HashMap::new(),
+        )
+        .expect("table should map");
         assert_eq!(object.title_property_api_name, "fullName");
     }
 
@@ -964,8 +1058,13 @@ mod tests {
         assert_eq!(primary_key.column_name, "show_id");
         assert!(primary_key.warning.is_some());
 
-        let object =
-            map_table(&table, &entity_names(&table.name), &primary_key).expect("table should map");
+        let object = map_table(
+            &table,
+            &entity_names(&table.name),
+            &primary_key,
+            &HashMap::new(),
+        )
+        .expect("table should map");
         assert_eq!(object.primary_key_property_api_name, "showId");
     }
 
@@ -995,8 +1094,13 @@ mod tests {
         assert_eq!(primary_key.column_name, "set_num");
         assert!(primary_key.warning.is_some());
 
-        let object =
-            map_table(&table, &entity_names(&table.name), &primary_key).expect("table should map");
+        let object = map_table(
+            &table,
+            &entity_names(&table.name),
+            &primary_key,
+            &HashMap::new(),
+        )
+        .expect("table should map");
         assert_eq!(object.primary_key_property_api_name, "setNum");
     }
 
@@ -1086,8 +1190,13 @@ mod tests {
         assert!(primary_key.synthetic_property.is_some());
         assert!(primary_key.warning.is_some());
 
-        let object =
-            map_table(&table, &entity_names(&table.name), &primary_key).expect("table should map");
+        let object = map_table(
+            &table,
+            &entity_names(&table.name),
+            &primary_key,
+            &HashMap::new(),
+        )
+        .expect("table should map");
         assert_eq!(object.primary_key_property_api_name, "playlistIdTrackIdKey");
         assert!(
             object
@@ -1140,6 +1249,7 @@ mod tests {
                 ],
                 return_type: Some("asset".to_owned()),
             }],
+            enum_types: vec![],
         };
 
         let module = map_schema_to_ontology(&schema).expect("schema should map");

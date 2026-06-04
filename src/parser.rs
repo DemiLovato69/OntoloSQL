@@ -3,18 +3,26 @@ use sqlparser::ast::{AlterTableOperation, ColumnOption, ObjectName, Statement, T
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::schema::{Column, DatabaseSchema, ForeignKey, SqlRoutine, SqlRoutineArg, Table};
+use crate::schema::{
+    Column, DatabaseSchema, ForeignKey, SqlEnumType, SqlRoutine, SqlRoutineArg, Table,
+};
 
 pub fn parse_postgres_schema(sql: &str) -> Result<DatabaseSchema> {
     let dialect = PostgreSqlDialect {};
     let mut tables = Vec::new();
     let mut foreign_keys = Vec::new();
     let mut routines = Vec::new();
+    let mut enum_types = Vec::new();
 
     for statement_sql in split_sql_statements(sql) {
         let parsed = match Parser::parse_sql(&dialect, &statement_sql) {
             Ok(statements) => statements,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(enum_type) = parse_create_enum_type(&statement_sql) {
+                    enum_types.push(enum_type);
+                }
+                continue;
+            }
         };
 
         for statement in parsed {
@@ -185,6 +193,7 @@ pub fn parse_postgres_schema(sql: &str) -> Result<DatabaseSchema> {
         tables,
         foreign_keys,
         routines,
+        enum_types,
     })
 }
 
@@ -193,6 +202,160 @@ fn parse_object_name(name: &ObjectName) -> String {
         .last()
         .map(|identifier| identifier.value.clone())
         .unwrap_or_default()
+}
+
+fn parse_create_enum_type(sql: &str) -> Option<SqlEnumType> {
+    let mut parser = EnumTypeParser::new(sql);
+    parser.parse()
+}
+
+struct EnumTypeParser<'a> {
+    sql: &'a str,
+    offset: usize,
+}
+
+impl<'a> EnumTypeParser<'a> {
+    fn new(sql: &'a str) -> Self {
+        Self { sql, offset: 0 }
+    }
+
+    fn parse(&mut self) -> Option<SqlEnumType> {
+        self.consume_keyword("create")?;
+        self.consume_keyword("type")?;
+        let name = self.parse_identifier()?;
+        self.consume_keyword("as")?;
+        self.consume_keyword("enum")?;
+        self.consume_char('(')?;
+
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_string_literal()?);
+            self.skip_whitespace();
+            if self.consume_char(',').is_some() {
+                continue;
+            }
+            self.consume_char(')')?;
+            break;
+        }
+
+        Some(SqlEnumType { name, values })
+    }
+
+    fn consume_keyword(&mut self, keyword: &str) -> Option<()> {
+        self.skip_whitespace();
+        let end = self.offset.checked_add(keyword.len())?;
+        let candidate = self.sql.get(self.offset..end)?;
+        if !candidate.eq_ignore_ascii_case(keyword) {
+            return None;
+        }
+        if self
+            .sql
+            .get(end..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        self.offset = end;
+        Some(())
+    }
+
+    fn consume_char(&mut self, expected: char) -> Option<()> {
+        self.skip_whitespace();
+        let rest = self.sql.get(self.offset..)?;
+        let ch = rest.chars().next()?;
+        if ch != expected {
+            return None;
+        }
+        self.offset += ch.len_utf8();
+        Some(())
+    }
+
+    fn parse_identifier(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let rest = self.sql.get(self.offset..)?;
+        let mut chars = rest.char_indices();
+        let (_, first) = chars.next()?;
+
+        if first == '"' {
+            let mut output = String::new();
+            while let Some((index, ch)) = chars.next() {
+                if ch == '"' {
+                    if chars
+                        .clone()
+                        .next()
+                        .is_some_and(|(_, next_ch)| next_ch == '"')
+                    {
+                        output.push('"');
+                        chars.next();
+                        continue;
+                    }
+                    self.offset += index + ch.len_utf8();
+                    return Some(output);
+                }
+                output.push(ch);
+            }
+            return None;
+        }
+
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return None;
+        }
+
+        let mut end = first.len_utf8();
+        for (index, ch) in chars {
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                end = index + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let identifier = rest.get(..end)?.to_owned();
+        self.offset += end;
+        Some(identifier)
+    }
+
+    fn parse_string_literal(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let rest = self.sql.get(self.offset..)?;
+        let mut chars = rest.char_indices();
+        let (_, first) = chars.next()?;
+        if first != '\'' {
+            return None;
+        }
+
+        let mut output = String::new();
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars
+                    .clone()
+                    .next()
+                    .is_some_and(|(_, next_ch)| next_ch == '\'')
+                {
+                    output.push('\'');
+                    chars.next();
+                    continue;
+                }
+                self.offset += index + ch.len_utf8();
+                return Some(output);
+            }
+            output.push(ch);
+        }
+        None
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(ch) = self
+            .sql
+            .get(self.offset..)
+            .and_then(|rest| rest.chars().next())
+        {
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.offset += ch.len_utf8();
+        }
+    }
 }
 
 fn split_sql_statements(sql: &str) -> Vec<String> {
@@ -277,7 +440,7 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                 let mut probe = String::from("$");
                 let lookahead = chars.clone();
 
-                for next in lookahead { 
+                for next in lookahead {
                     probe.push(next);
                     if next == '$' {
                         break;

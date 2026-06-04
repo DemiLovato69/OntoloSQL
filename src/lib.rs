@@ -81,6 +81,33 @@ mod tests {
     }
 
     #[test]
+    fn generates_value_types_for_postgres_enums() {
+        let sql = r#"
+            CREATE TYPE "employees_workerType" AS ENUM ('EMPLOYEE','CONTRACTOR');
+
+            CREATE TABLE "employees" (
+                "employeeId" VARCHAR(255) NOT NULL PRIMARY KEY,
+                "workerType" "employees_workerType" NOT NULL
+            );
+        "#;
+
+        let schema = parse_postgres_schema(sql).expect("schema should parse");
+        let module = map_schema_to_ontology(&schema).expect("schema should map");
+        let rendered = render_module(&module);
+
+        assert_eq!(schema.enum_types.len(), 1);
+        assert!(
+            rendered.contains("import { defineObject, defineValueType } from \"@osdk/maker\";")
+        );
+        assert!(rendered.contains("export const employeesWorkerTypeValueType = defineValueType({"));
+        assert!(rendered.contains("apiName: \"employeesWorkerType\""));
+        assert!(rendered.contains("allowedValues: [\"EMPLOYEE\", \"CONTRACTOR\"]"));
+        assert!(rendered.contains(
+            "\"workerType\": { type: \"string\", displayName: \"Worker Type\", valueType: employeesWorkerTypeValueType }"
+        ));
+    }
+
+    #[test]
     fn exposes_warning_when_primary_key_is_inferred() {
         let sql = r#"
             CREATE TABLE netflix_shows (
@@ -165,7 +192,9 @@ s2	Blood & Water
         assert!(rendered.contains("import { DELETE_OBJECT_PARAMETER, MODIFY_OBJECT_PARAMETER, defineAction, defineLink, defineObject } from \"@osdk/maker\";"));
         assert!(rendered.contains("export const createAsset = defineAction({"));
         assert!(rendered.contains("export const updateAsset = defineAction({"));
-        assert!(rendered.contains("export const setTelemetryHardAccelerationEvents = defineAction({"));
+        assert!(
+            rendered.contains("export const setTelemetryHardAccelerationEvents = defineAction({")
+        );
         assert!(rendered.contains("objectToModify: MODIFY_OBJECT_PARAMETER"));
         assert!(rendered.contains("objectToDelete: DELETE_OBJECT_PARAMETER"));
         assert!(module.actions.len() >= 10);

@@ -1,9 +1,18 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDefinition {
+    pub value_types: Vec<ValueTypeDefinition>,
     pub objects: Vec<ObjectDefinition>,
     pub links: Vec<LinkDefinition>,
     pub actions: Vec<ActionDefinition>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueTypeDefinition {
+    pub const_name: String,
+    pub api_name: String,
+    pub display_name: String,
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +31,7 @@ pub struct PropertyDefinition {
     pub api_name: String,
     pub display_name: String,
     pub osdk_type: String,
+    pub value_type_const_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

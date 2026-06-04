@@ -3,6 +3,7 @@ pub struct DatabaseSchema {
     pub tables: Vec<Table>,
     pub foreign_keys: Vec<ForeignKey>,
     pub routines: Vec<SqlRoutine>,
+    pub enum_types: Vec<SqlEnumType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,4 +42,10 @@ pub struct SqlRoutineArg {
     pub name: String,
     pub sql_type: String,
     pub has_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlEnumType {
+    pub name: String,
+    pub values: Vec<String>,
 }
